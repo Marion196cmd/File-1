@@ -1,0 +1,366 @@
+---
+title: "Assignment 2"
+author: "Marion"
+date: "2025-05-11
+output: html_document"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("purrr")
+library(purrr)
+library(class)
+library(caret)
+library(ggplot2)
+library(lattice)
+library(MASS)
+library(boot)
+library(ggcorrplot)
+library(corrplot)
+library(lmtest)
+library(tseries)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+```
+
+#Data loading
+
+```{r}
+weather<-read.csv("https://raw.githubusercontent.com/Marion196cmd/File-1/refs/heads/main/Summary%20of%20Weather.csv")
+station<-read.csv("https://raw.githubusercontent.com/Marion196cmd/File-1/refs/heads/main/Weather%20Station%20Locations.csv")
+```
+#Let us now edit the data
+```{r}
+combined_data <- left_join(weather, station, by = c("STA" = "WBAN"))
+data <- combined_data %>% select(where(~ !any(is.na(.))))
+head(data)
+```
+#Let us first visualise some of our data 
+```{r}
+data$Snowfall[data$snowfall %in% "NA"] <- 0
+data$PRCP[data$PRCP %in% "NA"] <- 0
+data$snowfall<-as.numeric(data$Snowfall)
+data$PRCP<-as.numeric((data$PRCP))
+elev_group<-cut(data$ELEV, breaks = c(0, 500, 1000, 1500, 2000, Inf))
+log_PRCP <-log(data$PRCP + 0.001)
+temp_diff<- data$MaxTemp - data$MinTemp
+# Temperature distribution
+ggplot(data, aes(x=MeanTemp)) +
+  geom_histogram(fill="skyblue", bins=30) +
+  ggtitle("Distribution of Mean Temperatures")
+# Geography interactions
+ggplot(data, aes(x=Latitude, y=MeanTemp, color=elev_group)) +
+  geom_point(alpha=0.5) +
+  geom_smooth(method="lm") +
+  ggtitle("Temperature vs Latitude by Elevation group")
+
+# Precipitation effects
+ggplot(data, aes(x=log_PRCP, y=MeanTemp)) +
+  geom_point(aes(color=Latitude)) +
+  geom_smooth(method="loess", color="red") +
+  facet_wrap(~ elev_group) +
+  ggtitle("Temperature vs Log Precipitation by Elevation group")
+```
+#Let us create a model accounting temperature
+```{r}
+wwii_weather_clean<- data%>%
+mutate(
+    Date = as.Date(Date, format="%Y-%m-%d"), 
+    Precip = as.numeric(ifelse(Precip == "T", 0.001, Precip)), 
+    PRCP = as.numeric(ifelse(PRCP == "T", 0.001, PRCP)), 
+    SNF = as.numeric(ifelse(SNF == "T", 0.001, SNF)),
+    DSN = as.numeric(Date - as.Date(paste0(year(Date), "-11-01"))), 
+    DSN = ifelse(DSN < 0, 365 + DSN, DSN)
+  ) %>%
+  filter(complete.cases(.))
+ggplot(wwii_weather_clean, aes(x=MaxTemp, y=MinTemp)) +
+  geom_point() +
+  geom_smooth(method="lm")
+model <- lm(MeanTemp ~ MaxTemp + MinTemp + PRCP+ DSN+ I(DSN^2), data=wwii_weather_clean)
+summary(model)
+```
+#In order to detect multicolinearity allow us to compute a correlation matrix
+```{r}
+cor_data <- wwii_weather_clean %>%
+  mutate(
+    MaxTemp = as.numeric(MaxTemp),
+    MinTemp = as.numeric(MinTemp),
+    PRCP = as.numeric(PRCP),  
+    Snowfall = as.numeric(Snowfall)  
+  ) %>%
+  select(MaxTemp, MinTemp, PRCP, Snowfall)
+cor_matrix <- cor(cor_data, use = "complete.obs")  
+corrplot::corrplot(cor_matrix, method = "circle")
+
+```
+
+#Let us now do a block bootstrap method and fit our model 
+```{r}
+set.seed(123)
+n <- nrow(wwii_weather_clean)
+L <- 7 
+B <- 1000
+block_bootstrap <- function(data, model_formula, L, B) {
+  coef_matrix <- matrix(NA, nrow=B, ncol=length(coef(model)))
+  pred_matrix <- matrix(NA, nrow=B, ncol=n)
+  for(i in 1:B) {
+     block_starts <- sample(1:(n-L+1), size=ceiling(n/L), replace=TRUE)
+    idx <- unlist(purrr::map(block_starts, ~.x:(.x+L-1))) %>% 
+      head(n) %>% 
+      na.omit()
+    boot_data <- data[idx, ]
+    boot_model <- lm(formula(model_formula), data=boot_data)
+    coef_matrix[i, ] <- coef(boot_model)
+    pred_matrix[i, ] <- predict(boot_model, newdata=data)
+  }
+  return(list(coefs=coef_matrix, preds=pred_matrix))
+}
+boot_results <- block_bootstrap(wwii_weather_clean, 
+                               formula(model), L, B)
+coef_ci <- apply(boot_results$coefs, 2, quantile, probs=c(0.025, 0.975))
+colnames(coef_ci) <- names(coef(model))
+```
+#We will compare the predicted values and find model metrics
+```{r}
+pred_ci <- apply(boot_results$preds, 2, quantile, probs=c(0.025, 0.975))
+
+wwii_weather_clean <- wwii_weather_clean %>%
+  mutate(
+    pred_mean = colMeans(boot_results$preds),
+    pred_lower = pred_ci[1, ],
+    pred_upper = pred_ci[2, ]
+  )
+rmse <- sqrt(mean((wwii_weather_clean$MeanTemp - wwii_weather_clean$pred_mean)^2))
+ggplot(wwii_weather_clean, aes(x=Date)) +
+  geom_line(aes(y=MeanTemp), color="black") +
+  geom_ribbon(aes(ymin=pred_lower, ymax=pred_upper), fill="blue", alpha=0.3) +
+  labs(title="Temperature Predictions with 95% CI", y="Mean Temperature")
+par(mfrow=c(2,2))
+plot(model)
+```
+
+ # Fit a model also considering geographical factors.
+```{r}
+data$Date <- as.Date(data$Date)
+data <- data %>%
+  filter(
+    !is.na(ELEV),
+    !is.na(Date),
+    !is.na(MeanTemp),
+    !is.na(MaxTemp),
+    !is.na(MinTemp),
+    !is.na(PRCP),
+    !is.na(Latitude)
+  )
+data <- data %>%
+  mutate(
+    elev_group = cut(
+      ELEV,
+      breaks = c(0, 500, 1000, 1500, 2000, max(ELEV, na.rm = TRUE)),
+      include.lowest = TRUE
+    ),
+    log_PRCP = log(PRCP + 0.001),
+    DSN = as.numeric(Date - as.Date(paste0(year(Date), "-11-01"))),
+    DSN = ifelse(DSN < 0, 365 + DSN, DSN)
+  )
+modeltotal <- lm(
+  MeanTemp ~ MaxTemp + MinTemp + log_PRCP * elev_group + log_PRCP * Latitude + DSN + I(DSN^2),
+  data = data
+)
+summary(modeltotal)
+
+```
+#Let us update our block bootstrap to fit this new model
+```{r}
+set.seed(123)
+newblock_bootstrap <- function(data, model_formula, L, B) {
+  full_model <- lm(model_formula, data = data)
+  coef_names <- names(coef(full_model))
+  n <- nrow(data)
+  coef_matrix <- matrix(NA, nrow = B, ncol = length(coef_names))
+  colnames(coef_matrix) <- coef_names
+  pred_matrix <- matrix(NA, nrow = B, ncol = n)
+  for (i in 1:B) {
+    block_starts <- sample(1:(n - L + 1), size = ceiling(n / L), replace = TRUE)
+    idx <- unlist(purrr::map(block_starts, ~ .x:(.x + L - 1))) %>%
+      head(n) %>%
+      na.omit()
+    boot_data <- data[idx, ]
+    boot_data$elev_group <- factor(boot_data$elev_group, levels = levels(data$elev_group))
+    boot_model <- tryCatch(
+      lm(model_formula, data = boot_data),
+      error = function(e) return(NULL)
+    )
+    if (!is.null(boot_model)) {
+      coefs <- coef(boot_model)
+      coef_matrix[i, names(coefs)] <- coefs
+      pred_matrix[i, ] <- tryCatch(
+        predict(boot_model, newdata = data),
+        error = function(e) rep(NA, n)
+      )
+    }
+  }
+  return(list(coefs = coef_matrix, preds = pred_matrix))
+}
+newboot<- newblock_bootstrap(data, formula(modeltotal), L, B)
+```
+
+#let us now look at the new model metrics
+```{r}
+newpred_ci <- apply(newboot$preds, 2, quantile, probs = c(0.025, 0.975))
+data <- data %>%
+  mutate(
+    newpred_mean = colMeans(newboot$preds),
+    newpred_lower = newpred_ci[1, ],
+    newpred_upper = newpred_ci[2, ]
+  )
+rmse <- sqrt(mean((data$MeanTemp - data$newpred_mean)^2))
+ggplot(data, aes(x = Date)) +
+  geom_line(aes(y = MeanTemp), color = "black") +
+  geom_line(aes(y = newpred_mean), color = "blue") +
+  geom_ribbon(aes(ymin = newpred_lower, ymax = newpred_upper), fill = "lightblue", alpha = 0.4) +
+  labs(
+    title = "Mean Temperature: Observed vs Predicted (New model)",
+    y = "Mean Temperature (°C)"
+  ) +
+  theme_minimal()
+par(mfrow=c(2,2))
+plot(modeltotal)
+```
+
+#Let us now compare the 2 models by looking 
+```{r}
+install.packages(purrr)
+library(purrr)
+dwtest(model)
+dwtest(modeltotal)
+acf(residuals(model), main="Residual autocorellation of simple model")
+acf(residuals(modeltotal), main="Residual autocorellation of updated model")
+models <- list(
+  "Base" = model,
+  "Final"= modeltotal
+)
+model_metrics <- map_df(models, ~{
+  data.frame(
+    AIC = AIC(.x),
+    BIC = BIC(.x),
+    R2_adj = summary(.x)$adj.r.squared,
+    RMSE = sqrt(mean(residuals(.x)^2))
+  )
+}, .id="Model")
+knitr::kable(model_metrics, caption="Model Comparison Metrics")
+```
+# Select a target station (example: Station 381 with specific geography)
+```{r}
+target_station <- data %>%
+  filter(STA == 381) %>%
+  slice(1) %>%
+  select(Latitude, ELEV, elev_group) %>%
+  distinct()
+create_scenarios <- function(original_data) {
+  modified_data <- original_data %>%
+    filter(STA == 381) %>%
+    mutate(
+      PRCP = PRCP * 1.10,
+      log_PRCP = log(PRCP + 0.001),
+      MaxTemp = MaxTemp + 2,
+      MinTemp = MinTemp + 2,
+      MeanTemp = MeanTemp + 2,
+      elev_PRCP = ELEV * log_PRCP,
+      lat_PRCP = Latitude * log_PRCP
+    )
+  bind_rows(
+    original_data %>%
+      mutate(scenario = "baseline"),
+    modified_data %>%
+      mutate(scenario = "modified")
+  )
+}
+scenario_predictions <- create_scenarios(data) %>%
+  group_by(scenario) %>%
+  mutate(
+    pred = predict(modeltotal, newdata = cur_data()),
+    pred_diff = pred - mean(pred, na.rm = TRUE)
+  )
+scenario_bootstrap <- function(data, model_formula, L = 7, B = 1000, modification_fn = NULL) {
+  full_model <- lm(model_formula, data = data)
+  coef_names <- names(coef(full_model))
+  n <- nrow(data)
+  coef_matrix <- matrix(NA, nrow = B, ncol = length(coef_names))
+  colnames(coef_matrix) <- coef_names
+  pred_matrix <- matrix(NA, nrow = B, ncol = n)
+  for (i in 1:B) {
+    block_starts <- sample(1:(n - L + 1), ceiling(n / L), replace = TRUE)
+    idx <- unlist(purrr::map(block_starts, ~.x:(.x + L - 1))) %>%
+      head(n) %>%
+      na.omit()
+    boot_data <- if (!is.null(modification_fn)) {
+      modification_fn(data[idx, ])
+    } else {
+      data[idx, ]
+    }
+    boot_data$elev_group <- factor(boot_data$elev_group, levels = levels(data$elev_group))
+    boot_model <- tryCatch(
+      lm(model_formula, data = boot_data),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(boot_model)) {
+      coefs <- coef(boot_model)
+      coef_matrix[i, names(coefs)] <- coefs
+      pred_matrix[i, ] <- tryCatch(
+        predict(boot_model, newdata = data),
+        error = function(e) rep(NA, n)
+      )
+    }
+  }
+  
+  return(list(coefs = coef_matrix, preds = pred_matrix))
+}
+modify_station <- function(data) {
+  data %>%
+    mutate(
+      PRCP = ifelse(ELEV > 500, PRCP * 1.10, PRCP),
+      log_PRCP = log(PRCP + 0.001),
+      elev_PRCP = ELEV * log_PRCP,
+      lat_PRCP = Latitude * log_PRCP
+    )
+}
+set.seed(3125)
+L <- 7
+B <- 1000
+boot_orig <- newblock_bootstrap(data, formula(modeltotal), L, B)
+boot_mod <- scenario_bootstrap(data, formula(modeltotal), L, B, modify_station)
+scenario_comparison <- bind_rows(
+  tibble(
+    Scenario = "Original",
+    RMSE = sqrt(mean((data$MeanTemp - colMeans(boot_orig$preds))^2)),
+    Temp_Effect = mean(colMeans(boot_orig$coefs[, grep("log_PRCP", colnames(boot_orig$coefs))]))
+  ),
+  tibble(
+    Scenario = "Modified",
+    RMSE = sqrt(mean((data$MeanTemp - colMeans(boot_mod$preds))^2)),
+    Temp_Effect = mean(colMeans(boot_mod$coefs[, grep("log_PRCP", colnames(boot_mod$coefs))]))
+  )
+)
+ggplot(scenario_comparison, aes(x = Scenario, y = Temp_Effect, fill = Scenario)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = Temp_Effect * 0.9, ymax = Temp_Effect * 1.1), width = 0.2) +
+  labs(
+    title = "Temperature Sensitivity to Precipitation Changes",
+    y = "Precipitation Effect Coefficient",
+    subtitle = "With 10% increased precipitation at high elevation stations"
+  ) +
+  theme_minimal()
+coef_comparison <- bind_rows(
+  boot_orig$coefs %>% as_tibble() %>% mutate(Scenario = "Original"),
+  boot_mod$coefs %>% as_tibble() %>% mutate(Scenario = "Modified")
+) %>%
+  pivot_longer(-Scenario, names_to = "Coefficient", values_to = "Value")
+ggplot(coef_comparison, aes(x = Value, fill = Scenario)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Coefficient, scales = "free") +
+  labs(title = "Bootstrap Coefficient Distributions by Scenario") +
+  theme_minimal()
+```
